@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Generate TOEIC Part 3-style dialogue transcript JSON using OpenAI Chat API.
+TOEIC Part 3-style dialogue transcript generator.
 
-Produces a 2-3 speaker conversation JSON ready for generator.tts.
+Uses OpenAI ChatCompletion to produce a 2-3 speaker conversation JSON
+that can be fed into ``generator.tts`` for audio synthesis.
 
 Usage (standalone):
     uv run python -m generator.transcript --topic "hotel check-in" --speakers 2
@@ -27,18 +28,22 @@ DEFAULT_CHAT_MODEL = "gpt-4o-mini"
 DEFAULT_OUTDIR = Path("transcripts")
 DEFAULT_TURNS = 6
 
+# ---------------------------------------------------------------------------
+# Voice / speaker presets
+# ---------------------------------------------------------------------------
+
 VOICE_POOL: Dict[str, List[Dict[str, Any]]] = {
     "female": [
         {"voice": "marin", "instructions": "Female speaker. Professional, calm, friendly, and easy to understand."},
         {"voice": "nova", "instructions": "Female speaker. Warm, expressive, and conversational."},
         {"voice": "shimmer", "instructions": "Female speaker. Clear, bright, and articulate."},
-        {"voice": "breeze", "instructions": "Female speaker. Relaxed, natural, and approachable."},
+        {"voice": "coral", "instructions": "Female speaker. Relaxed, natural, and approachable."},
     ],
     "male": [
-        {"voice": "cedar", "instructions": "Male speaker. Clear, neutral, professional, and slightly brisk."},
-        {"voice": "ash", "instructions": "Male speaker. Confident, steady, and composed."},
-        {"voice": "echo", "instructions": "Male speaker. Calm, measured, and authoritative."},
-        {"voice": "onyx", "instructions": "Male speaker. Deep, warm, and reassuring."},
+        {"voice": "cedar", "instructions": "Male speaker. Friendly, upbeat, and conversational with natural energy."},
+        {"voice": "ash", "instructions": "Male speaker. Warm, engaging, and approachable with a light tone."},
+        {"voice": "echo", "instructions": "Male speaker. Pleasant, clear, and naturally expressive."},
+        {"voice": "onyx", "instructions": "Male speaker. Easygoing, personable, and naturally warm."},
     ],
 }
 
@@ -55,7 +60,22 @@ SPEAKER_CONFIGS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Core functions
+# ---------------------------------------------------------------------------
+
+
 def build_prompt(topic: str, num_speakers: int, num_turns: int) -> str:
+    """Build a ChatCompletion prompt that asks the model to generate a TOEIC dialogue.
+
+    Args:
+        topic: Conversation topic (e.g. "hotel check-in").
+        num_speakers: Number of speakers (2 or 3).
+        num_turns: Total number of dialogue turns.
+
+    Returns:
+        A fully-formed prompt string ready to send to the Chat API.
+    """
     speaker_configs = SPEAKER_CONFIGS[num_speakers]
     speaker_ids = [s["id"] for s in speaker_configs]
     speaker_list = ", ".join(speaker_ids)
@@ -93,6 +113,18 @@ Rules for pause_ms_after:
 
 
 def assign_voices(num_speakers: int) -> Dict[str, Dict[str, Any]]:
+    """Randomly assign TTS voices to each speaker from the pool.
+
+    Each speaker receives a unique voice matching their gender.
+    The result dict is keyed by speaker ID (e.g. "W", "M")
+    and contains ``voice``, ``speed``, and ``instructions``.
+
+    Args:
+        num_speakers: Number of speakers (2 or 3).
+
+    Returns:
+        Speaker configuration dict ready to embed in the dialogue JSON.
+    """
     configs = SPEAKER_CONFIGS[num_speakers]
     used_female: List[int] = []
     used_male: List[int] = []
@@ -115,7 +147,25 @@ def assign_voices(num_speakers: int) -> Dict[str, Dict[str, Any]]:
     return speakers
 
 
-def generate_dialogue(client: OpenAI, model: str, topic: str, num_speakers: int, num_turns: int) -> Dict[str, Any]:
+def generate_dialogue(
+    client: OpenAI, model: str, topic: str, num_speakers: int, num_turns: int,
+) -> Dict[str, Any]:
+    """Call the ChatCompletion API to generate a dialogue and attach voice configs.
+
+    Args:
+        client: An authenticated OpenAI client instance.
+        model: Chat model name (e.g. "gpt-4o-mini").
+        topic: Conversation topic.
+        num_speakers: Number of speakers (2 or 3).
+        num_turns: Total number of dialogue turns.
+
+    Returns:
+        Complete dialogue dict with ``title``, ``slug``, ``speakers``, and ``lines``.
+
+    Raises:
+        RuntimeError: If the API returns an empty response.
+        ValueError: If the response is missing required fields.
+    """
     prompt = build_prompt(topic, num_speakers, num_turns)
 
     response = client.chat.completions.create(
@@ -141,6 +191,19 @@ def generate_dialogue(client: OpenAI, model: str, topic: str, num_speakers: int,
 
 
 def save_dialogue(data: Dict[str, Any], outdir: Path) -> Path:
+    """Write dialogue data to a JSON file under *outdir*.
+
+    The filename is derived from the ``slug`` field.  If a file with
+    the same name already exists, a numeric suffix is appended to
+    avoid overwriting.
+
+    Args:
+        data: Dialogue dict (as returned by :func:`generate_dialogue`).
+        outdir: Directory to save the JSON file in.
+
+    Returns:
+        The path to the written JSON file.
+    """
     outdir.mkdir(parents=True, exist_ok=True)
     slug = data.get("slug", "dialogue")
     out_path = outdir / f"{slug}.json"
@@ -156,7 +219,13 @@ def save_dialogue(data: Dict[str, Any], outdir: Path) -> Path:
     return out_path
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
 def build_argparser() -> argparse.ArgumentParser:
+    """Create the argument parser for standalone CLI usage."""
     parser = argparse.ArgumentParser(
         description="Generate TOEIC Part 3-style dialogue transcript JSON."
     )
@@ -169,6 +238,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    """CLI entry point: parse args, generate dialogue, save to disk."""
     parser = build_argparser()
     args = parser.parse_args()
 

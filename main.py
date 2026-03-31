@@ -2,6 +2,10 @@
 """
 TOEIC TTS Pipeline — transcript generation + audio synthesis in one shot.
 
+Orchestrates two stages:
+  1. Generate a TOEIC Part 3-style dialogue transcript (JSON) via ChatCompletion.
+  2. Synthesize the transcript into a merged audio file via OpenAI TTS.
+
 Usage:
     uv run python main.py --topic "hotel check-in"
     uv run python main.py --topic "project deadline" --speakers 3 --turns 8
@@ -35,6 +39,7 @@ load_dotenv()
 
 
 def build_argparser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser with transcript and TTS options."""
     parser = argparse.ArgumentParser(
         description="Generate TOEIC dialogue transcript and synthesize audio in one step.",
     )
@@ -69,6 +74,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    """Run the full pipeline: transcript generation → audio synthesis."""
     parser = build_argparser()
     args = parser.parse_args()
 
