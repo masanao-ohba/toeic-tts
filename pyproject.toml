@@ -1,0 +1,11 @@
+[project]
+name = "toeic-tts"
+version = "0.1.0"
+description = "English Listening Practice with TOEIC TTS"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "openai>=2.2.0",
+    "pydub>=0.25.1",
+    "python-dotenv>=1.0.1",
+]
