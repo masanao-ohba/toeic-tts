@@ -1,38 +1,52 @@
 #!/usr/bin/env python3
 """
-TOEIC Part 3-style dialogue audio synthesizer.
+TOEIC Part 3 / Part 4 audio synthesizer.
 
-Reads a dialogue JSON produced by ``generator.transcript``, synthesizes each
-utterance as a lossless WAV via OpenAI TTS, concatenates them with natural
-pauses, and optionally converts the final result to MP3.
+Reads a transcript JSON produced by ``generator.transcript`` (new
+``sections[]`` schema), synthesizes each line as a lossless WAV,
+concatenates all sections with fixed inter-section pauses (short
+between most sections, long before the answers), and optionally
+converts the final result to MP3.
 
 Pipeline:
-    API → per-line WAV → concat WAV → (optional) MP3 conversion
-
-Usage (standalone):
-    uv run python -m generator.tts transcripts/sample_dialogue.json --outdir output
+    API → per-line WAV → concat by section → WAV → (optional) MP3
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import wave
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import List, Tuple
 
 from dotenv import load_dotenv
 from openai import OpenAI
 from pydub import AudioSegment
 
+from generator.config import (
+    DEFAULT_TTS_MODEL,
+    DEFAULT_TTS_MP3_BITRATE,
+    DEFAULT_TTS_OUTPUT_FORMAT,
+    DEFAULT_TTS_SPEED,
+    LONG_PAUSE_MS,
+    PASSAGE_CAST_PROMPT,
+    SECTION_TRAILING_PAUSE_MS,
+    SHORT_PAUSE_MS,
+)
+from generator.types import Dialogue, DialogueLine, Section, SpeakerConfig
+
 load_dotenv()
 
-DEFAULT_MODEL = "gpt-4o-mini-tts"
-DEFAULT_OUTPUT_FORMAT = "mp3"
-DEFAULT_MP3_BITRATE = "128k"
-DEFAULT_SPEED = 0.97
+# Backwards-compatible aliases exposed to callers importing from tts.py.
+DEFAULT_MODEL = DEFAULT_TTS_MODEL
+DEFAULT_OUTPUT_FORMAT = DEFAULT_TTS_OUTPUT_FORMAT
+DEFAULT_MP3_BITRATE = DEFAULT_TTS_MP3_BITRATE
+DEFAULT_SPEED = DEFAULT_TTS_SPEED
+
+SECTION_SHORT_PAUSE_MS = SHORT_PAUSE_MS
+SECTION_LONG_PAUSE_MS = LONG_PAUSE_MS
 
 
 # ---------------------------------------------------------------------------
@@ -40,41 +54,12 @@ DEFAULT_SPEED = 0.97
 # ---------------------------------------------------------------------------
 
 
-def load_dialogue(path: Path) -> Dict[str, Any]:
-    """Load and validate a dialogue JSON file.
-
-    The JSON must contain a ``speakers`` object and a ``lines`` array.
-    Each line must reference a speaker defined in ``speakers``.
-
-    Args:
-        path: Path to the dialogue JSON file.
-
-    Returns:
-        Parsed dialogue dict.
-
-    Raises:
-        ValueError: If the JSON structure is invalid or references unknown speakers.
-    """
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    if "speakers" not in data or "lines" not in data:
-        raise ValueError("JSON must contain 'speakers' and 'lines'.")
-
-    if not isinstance(data["speakers"], dict) or not isinstance(data["lines"], list):
-        raise ValueError("'speakers' must be an object and 'lines' must be a list.")
-
-    for i, line in enumerate(data["lines"], start=1):
-        if "speaker" not in line or "text" not in line:
-            raise ValueError(f"Line {i} must contain 'speaker' and 'text'.")
-        if line["speaker"] not in data["speakers"]:
-            raise ValueError(f"Line {i} refers to unknown speaker: {line['speaker']}")
-
-    return data
+def load_dialogue(path: Path) -> Dialogue:
+    """Load and validate a transcript JSON file via the Pydantic model."""
+    return Dialogue.model_validate_json(path.read_text(encoding="utf-8"))
 
 
 def ensure_outdir(path: Path) -> None:
-    """Create the output directory (and parents) if it does not exist."""
     path.mkdir(parents=True, exist_ok=True)
 
 
@@ -84,47 +69,32 @@ def ensure_outdir(path: Path) -> None:
 
 
 def build_instructions(
-    speaker_cfg: Dict[str, Any],
-    line: Dict[str, Any],
-    scene: str,
-    prev_text: str,
+    speaker_cfg: SpeakerConfig,
+    section_type: str,
 ) -> str:
-    """Compose TTS instructions that produce a natural conversational tone.
+    base = speaker_cfg.instructions
 
-    Combines the speaker's base persona, the scene context, and the
-    previous utterance so that the TTS model delivers each line as
-    part of a flowing dialogue rather than an isolated statement.
-
-    Args:
-        speaker_cfg: Speaker definition from the dialogue JSON.
-        line: Current line dict (may override instructions).
-        scene: Scene description (typically the dialogue ``title``).
-        prev_text: The text of the immediately preceding line, or "" for the first line.
-
-    Returns:
-        A single instruction string for the TTS API.
-    """
-    base = line.get("instructions") or speaker_cfg.get("instructions", "")
-
-    context_parts = [base]
-
-    if scene:
-        context_parts.append(f"Scene: {scene}")
-
-    if prev_text:
-        context_parts.append(
-            f"You are responding to someone who just said: \"{prev_text}\" "
-            "— react naturally to what they said."
+    if section_type in (
+        "preview_questions",
+        "questions_with_choices",
+        "answers",
+    ):
+        return (
+            f"{base} You are a TOEIC test narrator. Read this English line "
+            f"clearly and precisely for a standardized listening test. Neutral "
+            f"tone, steady pace, no extra words or emotion."
         )
 
-    context_parts.append(
-        "You are in a live face-to-face conversation. "
-        "Match the energy and flow of the dialogue. "
-        "Speak naturally and clearly for English listening practice. "
-        "Do not add extra words, labels, or sound effects."
-    )
+    if section_type == "key_phrases":
+        return (
+            f"{base} You are a TOEIC key-phrase narrator. Each line contains an "
+            f"English phrase followed by its Japanese translation. Read the "
+            f"English portion first in clear English, then read the Japanese "
+            f"portion in natural, native-sounding Japanese. Neutral tone, steady "
+            f"pace, no extra words or emotion."
+        )
 
-    return " ".join(context_parts)
+    return f"{base} {PASSAGE_CAST_PROMPT}"
 
 
 def synthesize_one_line(
@@ -132,43 +102,24 @@ def synthesize_one_line(
     *,
     model: str,
     speaker_name: str,
-    speaker_cfg: Dict[str, Any],
-    line: Dict[str, Any],
+    speaker_cfg: SpeakerConfig,
+    line: DialogueLine,
     out_path: Path,
     default_speed: float,
-    scene: str = "",
-    prev_text: str = "",
+    section_type: str = "passage",
 ) -> None:
-    """Synthesize a single dialogue line and save it as a WAV file.
-
-    Always requests WAV from the API to keep per-line audio lossless.
-    Format conversion (e.g. to MP3) is handled later at the merge stage.
-
-    Args:
-        client: Authenticated OpenAI client.
-        model: TTS model name.
-        speaker_name: Speaker ID (for error messages).
-        speaker_cfg: Speaker configuration (voice, speed, instructions).
-        line: Current dialogue line dict.
-        out_path: Destination file path (.wav).
-        default_speed: Fallback speaking speed.
-        scene: Scene description passed to :func:`build_instructions`.
-        prev_text: Previous line's text passed to :func:`build_instructions`.
-
-    Raises:
-        ValueError: If the speaker has no voice configured.
-    """
-    voice = line.get("voice") or speaker_cfg.get("voice")
+    """Synthesize a single line and save it as a WAV file."""
+    voice = speaker_cfg.voice
     if not voice:
         raise ValueError(f"Speaker '{speaker_name}' has no voice configured.")
 
-    speed = float(line.get("speed", speaker_cfg.get("speed", default_speed)))
-    instructions = build_instructions(speaker_cfg, line, scene, prev_text)
+    speed = float(speaker_cfg.speed or default_speed)
+    instructions = build_instructions(speaker_cfg, section_type)
 
     with client.audio.speech.with_streaming_response.create(
         model=model,
         voice=voice,
-        input=line["text"],
+        input=line.text,
         instructions=instructions,
         response_format="wav",
         speed=speed,
@@ -182,7 +133,6 @@ def synthesize_one_line(
 
 
 def read_wav(path: Path) -> tuple[wave._wave_params, bytes]:
-    """Read a WAV file and return its parameters and raw frame data."""
     with wave.open(str(path), "rb") as wf:
         params = wf.getparams()
         frames = wf.readframes(wf.getnframes())
@@ -190,56 +140,44 @@ def read_wav(path: Path) -> tuple[wave._wave_params, bytes]:
 
 
 def silence_bytes(params: wave._wave_params, duration_ms: int) -> bytes:
-    """Generate raw silence bytes matching the given WAV parameters.
-
-    Args:
-        params: WAV parameters (channels, sample width, frame rate).
-        duration_ms: Duration of silence in milliseconds.
-
-    Returns:
-        A bytes object of zero-valued PCM samples.
-    """
     num_frames = int(params.framerate * duration_ms / 1000)
     bytes_per_frame = params.nchannels * params.sampwidth
     return b"\x00" * (num_frames * bytes_per_frame)
 
 
-def concat_wavs(wav_paths: List[Path], pause_ms_after: List[int], out_path: Path) -> None:
-    """Concatenate multiple WAV files with pauses between them.
+def concat_wavs(
+    wav_paths: List[Path],
+    pause_ms_after: List[int],
+    out_path: Path,
+) -> None:
+    """Concatenate WAV files, inserting per-line silence between them.
 
-    All input WAVs must share the same audio format (channels,
-    sample width, frame rate, compression type).
-
-    Args:
-        wav_paths: Ordered list of per-line WAV files.
-        pause_ms_after: Silence duration (ms) to insert after each file.
-        out_path: Destination path for the merged WAV.
-
-    Raises:
-        ValueError: If no paths are given or formats don't match.
+    ``pause_ms_after[i]`` is inserted after ``wav_paths[i]``. The pause
+    after the final element (if present) is written; pass 0 to suppress it.
     """
     if not wav_paths:
         raise ValueError("No wav files to concatenate.")
+    if len(pause_ms_after) != len(wav_paths):
+        raise ValueError(
+            f"pause_ms_after length ({len(pause_ms_after)}) must match "
+            f"wav_paths length ({len(wav_paths)})"
+        )
 
     base_params, first_frames = read_wav(wav_paths[0])
-
     merged = bytearray(first_frames)
-    if pause_ms_after:
+    if pause_ms_after[0]:
         merged.extend(silence_bytes(base_params, pause_ms_after[0]))
 
     for idx, wav_path in enumerate(wav_paths[1:], start=1):
         params, frames = read_wav(wav_path)
-
-        comparable_a = (base_params.nchannels, base_params.sampwidth, base_params.framerate, base_params.comptype)
-        comparable_b = (params.nchannels, params.sampwidth, params.framerate, params.comptype)
-        if comparable_a != comparable_b:
+        a = (base_params.nchannels, base_params.sampwidth, base_params.framerate, base_params.comptype)
+        b = (params.nchannels, params.sampwidth, params.framerate, params.comptype)
+        if a != b:
             raise ValueError(
-                f"WAV format mismatch while merging: {wav_path.name} "
-                f"{comparable_b} != {comparable_a}"
+                f"WAV format mismatch while merging: {wav_path.name} {b} != {a}"
             )
-
         merged.extend(frames)
-        if idx < len(pause_ms_after):
+        if pause_ms_after[idx]:
             merged.extend(silence_bytes(base_params, pause_ms_after[idx]))
 
     with wave.open(str(out_path), "wb") as wf:
@@ -256,13 +194,6 @@ def concat_wavs(wav_paths: List[Path], pause_ms_after: List[int], out_path: Path
 
 
 def convert_wav_to_mp3(wav_path: Path, mp3_path: Path, bitrate: str = DEFAULT_MP3_BITRATE) -> None:
-    """Convert a WAV file to MP3 using pydub (requires ffmpeg).
-
-    Args:
-        wav_path: Source WAV file.
-        mp3_path: Destination MP3 file.
-        bitrate: Target bitrate (e.g. "128k", "256k").
-    """
     audio = AudioSegment.from_wav(str(wav_path))
     audio.export(str(mp3_path), format="mp3", bitrate=bitrate)
 
@@ -272,28 +203,68 @@ def convert_wav_to_mp3(wav_path: Path, mp3_path: Path, bitrate: str = DEFAULT_MP
 # ---------------------------------------------------------------------------
 
 
-def write_transcript(data: Dict[str, Any], out_path: Path) -> None:
-    """Write a human-readable text transcript alongside the audio files.
-
-    Args:
-        data: Dialogue dict containing ``title`` and ``lines``.
-        out_path: Destination text file path.
-    """
-    title = data.get("title", "Untitled Dialogue")
-    lines = data["lines"]
+def write_transcript(data: Dialogue, out_path: Path) -> None:
+    """Write a human-readable text version of the transcript."""
+    title = data.title
+    part = data.part
+    difficulty = data.difficulty
 
     with out_path.open("w", encoding="utf-8") as f:
-        f.write(f"{title}\n")
-        f.write("=" * len(title) + "\n\n")
-        for i, line in enumerate(lines, start=1):
-            pause_ms = line.get("pause_ms_after", 400)
-            f.write(f"{i:02d}. [{line['speaker']}] {line['text']}\n")
-            f.write(f"    pause_ms_after={pause_ms}\n")
+        header = f"{title}  [Part {part} / {difficulty}]"
+        f.write(header + "\n")
+        f.write("=" * len(header) + "\n\n")
+
+        idx = 1
+        for section in data.sections:
+            f.write(f"-- {section.type} --\n")
+            for line in section.lines:
+                f.write(f"{idx:02d}. [{line.speaker}] {line.text}\n")
+                f.write(f"    pause_ms_after={line.pause_ms_after}\n")
+                idx += 1
+            f.write("\n")
+
+        if data.questions:
+            f.write("== Answer Key ==\n")
+            for q in data.questions:
+                f.write(f"Q{q.id}: {q.answer}\n")
+            f.write("\n")
+
+        if data.key_phrases:
+            f.write("== Key Phrases ==\n")
+            for i, kp in enumerate(data.key_phrases, start=1):
+                f.write(f"{i:02d}. {kp.en}\n")
+                f.write(f"    -> {kp.ja}\n")
 
 
 # ---------------------------------------------------------------------------
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
+
+
+def _trailing_pause_for(section_type: str) -> int:
+    """Return the section-boundary pause (ms) inserted after the final line
+    of the given section. Section boundaries always use the fixed spec
+    pauses so audio layout is stable regardless of per-line hints."""
+    return SECTION_TRAILING_PAUSE_MS.get(section_type, SHORT_PAUSE_MS)
+
+
+def _iter_section_lines(
+    sections: List[Section],
+) -> List[Tuple[int, str, DialogueLine, bool]]:
+    """Flatten sections into (global_index, section_type, line, is_last_in_section).
+
+    Index starts at 1 for file naming.
+    """
+    out: List[Tuple[int, str, DialogueLine, bool]] = []
+    idx = 1
+    for section in sections:
+        stype = section.type
+        lines = section.lines
+        for i, line in enumerate(lines):
+            is_last = i == len(lines) - 1
+            out.append((idx, stype, line, is_last))
+            idx += 1
+    return out
 
 
 def run(
@@ -304,27 +275,7 @@ def run(
     mp3_bitrate: str = DEFAULT_MP3_BITRATE,
     speed: float = DEFAULT_SPEED,
 ) -> Path:
-    """Run the full audio generation pipeline.
-
-    1. Synthesize each dialogue line as a lossless WAV.
-    2. Concatenate all WAVs with inter-turn pauses.
-    3. Convert the merged WAV to the requested output format.
-    4. Clean up intermediate WAV files (when output is MP3).
-
-    Args:
-        dialogue_json: Path to the dialogue JSON file.
-        outdir: Directory for generated audio and transcript.
-        model: OpenAI TTS model name.
-        output_format: Final format — ``"mp3"`` or ``"wav"``.
-        mp3_bitrate: Bitrate for MP3 encoding (e.g. ``"128k"``).
-        speed: Default speaking speed (0.25–4.0).
-
-    Returns:
-        Path to the final merged audio file.
-
-    Raises:
-        RuntimeError: If no API key is configured.
-    """
+    """Run the full audio pipeline against a sections[] transcript."""
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY or API_KEY is not set.")
@@ -334,18 +285,19 @@ def run(
 
     client = OpenAI(api_key=api_key)
 
-    # Step 1: Synthesize each line as WAV (lossless)
-    scene = data.get("title", "")
+    sections = data.sections
+    total_lines = sum(len(s.lines) for s in sections)
+
     per_line_paths: List[Path] = []
     pauses: List[int] = []
-    prev_text = ""
 
-    for i, line in enumerate(data["lines"], start=1):
-        speaker_name = line["speaker"]
-        speaker_cfg = data["speakers"][speaker_name]
-        line_path = outdir / f"{i:02d}_{speaker_name}.wav"
+    flat = _iter_section_lines(sections)
+    for (idx, stype, line, is_last_in_section) in flat:
+        speaker_name = line.speaker
+        speaker_cfg = data.speakers[speaker_name]
+        line_path = outdir / f"{idx:02d}_{stype}_{speaker_name}.wav"
 
-        print(f"[{i}/{len(data['lines'])}] Synthesizing {line_path.name} ...")
+        print(f"[{idx}/{total_lines}] ({stype}) {line_path.name}")
         synthesize_one_line(
             client,
             model=model,
@@ -354,22 +306,24 @@ def run(
             line=line,
             out_path=line_path,
             default_speed=speed,
-            scene=scene,
-            prev_text=prev_text,
+            section_type=stype,
         )
 
-        prev_text = line["text"]
         per_line_paths.append(line_path)
-        pauses.append(int(line.get("pause_ms_after", 400)))
+
+        # Intra-section line pauses come from the transcript builder;
+        # section boundaries are overridden with the fixed spec pauses.
+        if is_last_in_section:
+            pauses.append(_trailing_pause_for(stype))
+        else:
+            pauses.append(int(line.pause_ms_after))
 
     write_transcript(data, outdir / "transcript.txt")
 
-    # Step 2: Concat WAVs into one full WAV
-    final_name = data.get("slug", "toeic_part3_dialogue")
+    final_name = data.slug or "toeic_listening"
     full_wav = outdir / f"{final_name}_full.wav"
     concat_wavs(per_line_paths, pauses, full_wav)
 
-    # Step 3: Convert to final format
     if output_format == "mp3":
         full_mp3 = outdir / f"{final_name}_full.mp3"
         print(f"Converting to MP3 ({mp3_bitrate}) ...")
@@ -380,7 +334,6 @@ def run(
         print(f"\nDone: {full_mp3}")
         return full_mp3
 
-    # WAV: keep as-is
     print(f"\nDone: {full_wav}")
     return full_wav
 
@@ -391,36 +344,19 @@ def run(
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    """Create the argument parser for standalone CLI usage."""
     parser = argparse.ArgumentParser(
-        description="Generate TOEIC Part 3-style multi-speaker dialogue audio."
+        description="Synthesize TOEIC Part 3 / Part 4 audio from a sections[] transcript."
     )
-    parser.add_argument("dialogue_json", type=Path, help="Path to dialogue JSON")
-    parser.add_argument("--outdir", type=Path, default=Path("output"), help="Output directory")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="TTS model name")
-    parser.add_argument(
-        "--output-format",
-        default=DEFAULT_OUTPUT_FORMAT,
-        choices=["wav", "mp3"],
-        help="Final output format (default: mp3)",
-    )
-    parser.add_argument(
-        "--mp3-bitrate",
-        default=DEFAULT_MP3_BITRATE,
-        choices=["128k", "256k"],
-        help="MP3 bitrate (default: 128k)",
-    )
-    parser.add_argument(
-        "--speed",
-        type=float,
-        default=DEFAULT_SPEED,
-        help="Default speaking speed (0.25 to 4.0)",
-    )
+    parser.add_argument("dialogue_json", type=Path)
+    parser.add_argument("--outdir", type=Path, default=Path("output"))
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--output-format", default=DEFAULT_OUTPUT_FORMAT, choices=["wav", "mp3"])
+    parser.add_argument("--mp3-bitrate", default=DEFAULT_MP3_BITRATE, choices=["128k", "256k"])
+    parser.add_argument("--speed", type=float, default=DEFAULT_SPEED)
     return parser
 
 
 def main() -> int:
-    """CLI entry point: parse args, run the full synthesis pipeline."""
     parser = build_argparser()
     args = parser.parse_args()
 
@@ -436,6 +372,9 @@ def main() -> int:
     except RuntimeError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
 
     return 0
 
