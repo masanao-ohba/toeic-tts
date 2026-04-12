@@ -25,7 +25,8 @@ from dotenv import load_dotenv
 from openai import OpenAI
 
 from generator.config import (
-    ANSWER_PAUSE_MS,
+    ANSWER_REVEAL_PAUSE_MS,
+    ANSWER_WAIT_MS,
     CHOICE_PAUSE_MS,
     DEFAULT_CHAT_MODEL,
     DEFAULT_DIFFICULTY,
@@ -255,9 +256,11 @@ def _build_passage_section(passage_lines: List[PassageLine]) -> Section:
     return finalize_section("passage", segments)
 
 
-def _build_questions_with_choices_section(
+def _build_questions_and_answers_section(
     questions: List[Question],
 ) -> Section:
+    """Build a section that interleaves each question's choices with its
+    answer: Q1 → A/B/C/D → (wait) → answer1 → Q2 → ... → answer3."""
     segments: List[Segment] = []
     for q in questions:
         segments.append(
@@ -267,9 +270,6 @@ def _build_questions_with_choices_section(
                 pause_ms_after=CHOICE_PAUSE_MS,
             )
         )
-        # Structural rule: A/B/C use the inter-choice pause; D is the
-        # transition into the next question stem. The trailing pause of
-        # the very last D (last question) is normalized by finalize_section.
         for label in ("A", "B", "C"):
             segments.append(
                 Segment(
@@ -278,26 +278,23 @@ def _build_questions_with_choices_section(
                     pause_ms_after=CHOICE_PAUSE_MS,
                 )
             )
+        # D choice gets a long wait before the answer reveal
         segments.append(
             Segment(
                 speaker=NARRATOR_ID,
                 text=format_choice("D", q.choices.D),
-                pause_ms_after=QUESTION_PAUSE_MS,
+                pause_ms_after=ANSWER_WAIT_MS,
             )
         )
-    return finalize_section("questions_with_choices", segments)
-
-
-def _build_answers_section(questions: List[Question]) -> Section:
-    segments = [
-        Segment(
-            speaker=NARRATOR_ID,
-            text=format_answer(q),
-            pause_ms_after=ANSWER_PAUSE_MS,
+        # Answer reveal, then a short pause before next question
+        segments.append(
+            Segment(
+                speaker=NARRATOR_ID,
+                text=format_answer(q),
+                pause_ms_after=ANSWER_REVEAL_PAUSE_MS,
+            )
         )
-        for q in questions
-    ]
-    return finalize_section("answers", segments)
+    return finalize_section("questions_and_answers", segments)
 
 
 def _build_key_phrases_section(key_phrases: List[KeyPhrase]) -> Section:
@@ -329,14 +326,14 @@ def build_sections(
     """Assemble the sections that feed the audio pipeline.
 
     Section order:
-        preview_questions, passage, questions_with_choices, answers, key_phrases.
-    The section-level long/short pauses are inserted by the TTS merge step.
+        preview_questions, passage, questions_and_answers, key_phrases.
+    Each question is immediately followed by its answer after a thinking
+    pause. The section-level pauses are inserted by the TTS merge step.
     """
     return [
         _build_preview_questions_section(questions),
         _build_passage_section(passage_lines),
-        _build_questions_with_choices_section(questions),
-        _build_answers_section(questions),
+        _build_questions_and_answers_section(questions),
         _build_key_phrases_section(key_phrases),
     ]
 

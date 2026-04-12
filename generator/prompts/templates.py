@@ -15,11 +15,11 @@ PART4_ROLE_HEADER = "You are a TOEIC Part 4 (short talks) test content creator."
 
 DIFFICULTY_BLOCKS: Dict[str, str] = {
     "advanced": (
-        "Difficulty: ADVANCED (TOEIC 800+). Use sophisticated business vocabulary "
-        "(e.g. 'consolidate', 'implement', 'streamline', 'discrepancy', 'contingent', "
-        "'reimbursement', 'quarterly projections'). Employ complex sentence structures "
-        "with subordinate clauses, passive voice, and occasional inversion. Include "
-        "idiomatic business expressions and phrasal verbs. Avoid simplistic phrasing."
+        "Difficulty: ADVANCED (TOEIC 800+). Use natural, professional English that "
+        "a fluent business speaker would actually use. Sentence structures may include "
+        "subordinate clauses, passive voice, and idiomatic expressions, but only where "
+        "they arise naturally — never force sophisticated vocabulary just to sound "
+        "advanced. Prioritize realistic, conversational flow over lexical showmanship."
     ),
     "intermediate": (
         "Difficulty: INTERMEDIATE (TOEIC 600-750). Use common business vocabulary "
@@ -42,11 +42,12 @@ TRAP_GUIDANCE_BLOCK = (
     "to the topic but not actually mentioned or implied.\n"
     "  5. Over-generalization / over-specification: wrong choices are too broad or "
     "too narrow compared to what the passage actually states.\n"
-    "Use TOEIC high-frequency business vocabulary throughout: schedule, appointment, "
-    "reservation, invoice, shipment, warranty, merger, inventory, recruitment, "
-    "compliance, itinerary, agenda, proposal, quotation, renovation, relocation, "
-    "subscription, reimbursement, amenities, venue, etc. as appropriate.\n"
-    "The correct answer must be unambiguously supported by the passage."
+    "The correct answer must be unambiguously supported by the passage.\n\n"
+    "NATURALNESS: The passage must sound like a real conversation or announcement "
+    "that could actually happen. Do NOT shoehorn business jargon or TOEIC-specific "
+    "vocabulary into the passage. Use domain-appropriate language that fits the "
+    "specific scenario (e.g. a museum tour should use museum vocabulary, not "
+    "corporate finance terms). Vary sentence patterns and avoid formulaic structures."
 )
 
 
@@ -98,6 +99,10 @@ Generate TOEIC Part {part} listening practice content on the topic: "{topic}".
 PASSAGE REQUIREMENTS:
 {passage_spec}
 - Use natural, professional English at the specified difficulty
+- VARIETY: Stay closely on the given topic. Do NOT drift toward generic
+  business themes (quarterly reports, budget reviews, deadline extensions)
+  unless the topic specifically asks for them. Let the scenario, setting,
+  and vocabulary be shaped by the topic itself
 
 QUESTION REQUIREMENTS:
 {questions_block}
@@ -105,11 +110,11 @@ QUESTION REQUIREMENTS:
 {trap_block}
 
 KEY PHRASES REQUIREMENTS:
-- Select between {min_key_phrases} and {max_key_phrases} important expressions
-  that ACTUALLY appear in the passage (verbatim or as a clear collocation)
-  AND are high-frequency on the TOEIC test.
-- Prefer multi-word collocations, business idioms, and useful phrasal verbs
-  over single common words.
+- Select between {min_key_phrases} and {max_key_phrases} expressions from the
+  passage that a learner at this level might NOT already know.
+- Focus on phrases that would genuinely expand the listener's vocabulary:
+  idiomatic expressions, phrasal verbs, less common collocations, or
+  domain-specific terms. Skip basic words the learner already knows.
 - For each entry, provide a concise Japanese gloss (roughly 6-18 characters,
   no full sentences, no trailing punctuation needed).
 

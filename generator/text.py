@@ -13,7 +13,7 @@ from generator.types import KeyPhrase, Question
 EN_TERMINAL: tuple[str, ...] = (".", "!", "?")
 JA_TERMINAL: tuple[str, ...] = ("。", ".", "!", "?", "！", "？")
 
-KEY_PHRASES_LEAD_TEXT: str = "Key phrases."
+KEY_PHRASES_LEAD_TEXT: str = "Useful phrases to remember."
 
 
 def ensure_en_terminal(text: str) -> str:
@@ -36,7 +36,7 @@ def format_choice(label: str, choice_text: str) -> str:
 
 def format_answer(q: Question) -> str:
     spoken = NUMBER_WORDS.get(q.id, str(q.id))
-    return f"Number {spoken}. {ensure_en_terminal(q.correct_text)}"
+    return f"Number {spoken}. ({q.answer}) {ensure_en_terminal(q.correct_text)}"
 
 
 def format_key_phrase(kp: KeyPhrase) -> str:

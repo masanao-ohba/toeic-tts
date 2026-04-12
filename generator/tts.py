@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tempfile
 import wave
 from pathlib import Path
 from typing import List, Tuple
@@ -76,8 +77,7 @@ def build_instructions(
 
     if section_type in (
         "preview_questions",
-        "questions_with_choices",
-        "answers",
+        "questions_and_answers",
     ):
         return (
             f"{base} You are a TOEIC test narrator. Read this English line "
@@ -274,8 +274,15 @@ def run(
     output_format: str = DEFAULT_OUTPUT_FORMAT,
     mp3_bitrate: str = DEFAULT_MP3_BITRATE,
     speed: float = DEFAULT_SPEED,
+    work_dir: Path | None = None,
 ) -> Path:
-    """Run the full audio pipeline against a sections[] transcript."""
+    """Run the full audio pipeline against a sections[] transcript.
+
+    Intermediate WAV files are created in a temporary directory and
+    cleaned up automatically. Only the final output (MP3 or WAV) is
+    written to ``outdir``. If ``work_dir`` is given, the human-readable
+    transcript text is saved there.
+    """
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY or API_KEY is not set.")
@@ -288,54 +295,57 @@ def run(
     sections = data.sections
     total_lines = sum(len(s.lines) for s in sections)
 
-    per_line_paths: List[Path] = []
-    pauses: List[int] = []
-
-    flat = _iter_section_lines(sections)
-    for (idx, stype, line, is_last_in_section) in flat:
-        speaker_name = line.speaker
-        speaker_cfg = data.speakers[speaker_name]
-        line_path = outdir / f"{idx:02d}_{stype}_{speaker_name}.wav"
-
-        print(f"[{idx}/{total_lines}] ({stype}) {line_path.name}")
-        synthesize_one_line(
-            client,
-            model=model,
-            speaker_name=speaker_name,
-            speaker_cfg=speaker_cfg,
-            line=line,
-            out_path=line_path,
-            default_speed=speed,
-            section_type=stype,
-        )
-
-        per_line_paths.append(line_path)
-
-        # Intra-section line pauses come from the transcript builder;
-        # section boundaries are overridden with the fixed spec pauses.
-        if is_last_in_section:
-            pauses.append(_trailing_pause_for(stype))
-        else:
-            pauses.append(int(line.pause_ms_after))
-
-    write_transcript(data, outdir / "transcript.txt")
-
     final_name = data.slug or "toeic_listening"
-    full_wav = outdir / f"{final_name}_full.wav"
-    concat_wavs(per_line_paths, pauses, full_wav)
 
-    if output_format == "mp3":
-        full_mp3 = outdir / f"{final_name}_full.mp3"
-        print(f"Converting to MP3 ({mp3_bitrate}) ...")
-        convert_wav_to_mp3(full_wav, full_mp3, bitrate=mp3_bitrate)
-        full_wav.unlink()
-        for p in per_line_paths:
-            p.unlink()
-        print(f"\nDone: {full_mp3}")
-        return full_mp3
+    with tempfile.TemporaryDirectory(prefix="toeic_tts_") as tmpdir:
+        workdir = Path(tmpdir)
+        per_line_paths: List[Path] = []
+        pauses: List[int] = []
 
-    print(f"\nDone: {full_wav}")
-    return full_wav
+        flat = _iter_section_lines(sections)
+        for (idx, stype, line, is_last_in_section) in flat:
+            speaker_name = line.speaker
+            speaker_cfg = data.speakers[speaker_name]
+            line_path = workdir / f"{idx:02d}_{stype}_{speaker_name}.wav"
+
+            print(f"[{idx}/{total_lines}] ({stype}) {line_path.name}")
+            synthesize_one_line(
+                client,
+                model=model,
+                speaker_name=speaker_name,
+                speaker_cfg=speaker_cfg,
+                line=line,
+                out_path=line_path,
+                default_speed=speed,
+                section_type=stype,
+            )
+
+            per_line_paths.append(line_path)
+
+            if is_last_in_section:
+                pauses.append(_trailing_pause_for(stype))
+            else:
+                pauses.append(int(line.pause_ms_after))
+
+        txt_dir = work_dir if work_dir is not None else workdir
+        txt_dir.mkdir(parents=True, exist_ok=True)
+        write_transcript(data, txt_dir / "transcript.txt")
+
+        full_wav = workdir / f"{final_name}_full.wav"
+        concat_wavs(per_line_paths, pauses, full_wav)
+
+        if output_format == "mp3":
+            full_mp3 = outdir / f"{final_name}_full.mp3"
+            print(f"Converting to MP3 ({mp3_bitrate}) ...")
+            convert_wav_to_mp3(full_wav, full_mp3, bitrate=mp3_bitrate)
+            print(f"\nDone: {full_mp3}")
+            return full_mp3
+
+        import shutil
+        final_out = outdir / f"{final_name}_full.wav"
+        shutil.move(str(full_wav), str(final_out))
+        print(f"\nDone: {final_out}")
+        return final_out
 
 
 # ---------------------------------------------------------------------------

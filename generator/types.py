@@ -17,8 +17,7 @@ from generator.config import MAX_KEY_PHRASES, MIN_KEY_PHRASES
 SectionType = Literal[
     "preview_questions",
     "passage",
-    "questions_with_choices",
-    "answers",
+    "questions_and_answers",
     "key_phrases",
 ]
 Difficulty = Literal["intermediate", "advanced"]

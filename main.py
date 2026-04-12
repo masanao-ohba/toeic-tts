@@ -30,6 +30,7 @@ from generator.config import (
     DEFAULT_TTS_MP3_BITRATE as DEFAULT_MP3_BITRATE,
     DEFAULT_TTS_OUTPUT_FORMAT as DEFAULT_OUTPUT_FORMAT,
     DEFAULT_TTS_SPEED as DEFAULT_SPEED,
+    DEFAULT_WORK_DIR,
     VALID_DIFFICULTIES,
     VALID_PARTS,
 )
@@ -79,6 +80,7 @@ def build_argparser() -> argparse.ArgumentParser:
     # Output options
     parser.add_argument("--transcript-dir", type=Path, default=None, help="Transcript output directory (default: transcripts)")
     parser.add_argument("--audio-dir", type=Path, default=None, help="Audio output base directory (default: output)")
+    parser.add_argument("--work-dir", type=Path, default=None, help="Work output directory for json/txt (default: work)")
 
     return parser
 
@@ -97,6 +99,7 @@ class Settings:
     mp3_bitrate: str
     transcript_dir: Path
     audio_dir: Path
+    work_dir: Path
 
 
 def _load_config(path: Optional[Path]) -> Dict[str, Any]:
@@ -151,6 +154,7 @@ def _resolve_settings(args: argparse.Namespace) -> Settings:
 
     transcript_dir = _merge(args.transcript_dir, cfg, "transcript_dir", DEFAULT_TRANSCRIPT_DIR)
     audio_dir = _merge(args.audio_dir, cfg, "audio_dir", DEFAULT_AUDIO_DIR)
+    work_dir = _merge(args.work_dir, cfg, "work_dir", DEFAULT_WORK_DIR)
 
     return Settings(
         part=part,
@@ -165,6 +169,7 @@ def _resolve_settings(args: argparse.Namespace) -> Settings:
         mp3_bitrate=_merge(args.mp3_bitrate, cfg, "mp3_bitrate", DEFAULT_MP3_BITRATE),
         transcript_dir=Path(transcript_dir),
         audio_dir=Path(audio_dir),
+        work_dir=Path(work_dir),
     )
 
 
@@ -197,26 +202,25 @@ def main() -> int:
         part=settings.part,
         difficulty=settings.difficulty,
     )
-    transcript_path = save_dialogue(data, settings.transcript_dir)
+    settings.work_dir.mkdir(parents=True, exist_ok=True)
+    transcript_path = save_dialogue(data, settings.work_dir)
 
-    print(f"Saved: {transcript_path}")
+    print(f"Transcript (work): {transcript_path}")
     print(f"Title: {data.title}")
     print(f"Sections: {[s.type for s in data.sections]}")
     print(f"Questions: {len(data.questions)}")
 
-    slug = data.slug or "toeic_listening"
-    audio_outdir = settings.audio_dir / slug
-
     print("\n=== Step 2: Generating audio ===")
-    print(f"Output: {audio_outdir}/")
+    print(f"Output: {settings.audio_dir}/")
 
     run_tts(
         dialogue_json=transcript_path,
-        outdir=audio_outdir,
+        outdir=settings.audio_dir,
         model=settings.tts_model,
         output_format=settings.output_format,
         mp3_bitrate=settings.mp3_bitrate,
         speed=settings.speed,
+        work_dir=settings.work_dir,
     )
 
     return 0

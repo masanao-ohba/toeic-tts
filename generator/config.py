@@ -17,8 +17,7 @@ from typing import Any, Dict, List, Tuple
 SECTION_ORDER: Tuple[str, ...] = (
     "preview_questions",
     "passage",
-    "questions_with_choices",
-    "answers",
+    "questions_and_answers",
     "key_phrases",
 )
 
@@ -31,15 +30,15 @@ LONG_PAUSE_MS = 8000
 SECTION_TRAILING_PAUSE_MS: Dict[str, int] = {
     "preview_questions": SHORT_PAUSE_MS,
     "passage": SHORT_PAUSE_MS,
-    "questions_with_choices": LONG_PAUSE_MS,
-    "answers": SHORT_PAUSE_MS,
+    "questions_and_answers": SHORT_PAUSE_MS,
     "key_phrases": 0,
 }
 
 # Intra-section pause defaults (ms).
 QUESTION_PAUSE_MS = 600
 CHOICE_PAUSE_MS = 400
-ANSWER_PAUSE_MS = 700
+ANSWER_WAIT_MS = 2500    # pause after D choice before revealing the answer
+ANSWER_REVEAL_PAUSE_MS = 1200  # pause after answer before next question
 PASSAGE_PAUSE_MS = 450
 KEY_PHRASE_PAUSE_MS = 800
 KEY_PHRASE_LEAD_PAUSE_MS = 500
@@ -79,6 +78,7 @@ DEFAULT_TTS_SPEED = 0.97
 
 DEFAULT_TRANSCRIPT_DIR = Path("transcripts")
 DEFAULT_AUDIO_DIR = Path("output")
+DEFAULT_WORK_DIR = Path("work")
 
 # ---------------------------------------------------------------------------
 # Number words (1..10) for spoken answer announcements
