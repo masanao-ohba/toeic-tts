@@ -1,54 +1,33 @@
-#!/usr/bin/env python3
-"""
-TOEIC Part 3 / Part 4 transcript generator.
+"""TOEIC Part 3 / Part 4 transcript generation.
 
-Uses OpenAI ChatCompletion to produce either a multi-speaker dialogue
-(Part 3) or a single-speaker narration (Part 4), along with three
-comprehension questions and four choices each. Output follows the
-``sections[]`` schema consumed by ``generator.tts``.
-
-Usage (standalone):
-    uv run python -m generator.transcript --part 3 --topic "hotel check-in"
-    uv run python -m generator.transcript --part 4 --topic "company announcement" --difficulty advanced
+Calls the OpenAI chat API with a structured-output schema, then
+assembles a fully-rendered Dialogue ready for the TTS stage. Inputs
+are trusted: the caller (``main.py``) has already validated them at
+the CLI boundary.
 """
 
 from __future__ import annotations
 
-import argparse
-import os
 import random
-import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from dotenv import load_dotenv
 from openai import OpenAI
 
 from generator.config import (
-    ANSWER_REVEAL_PAUSE_MS,
-    ANSWER_WAIT_MS,
-    CHOICE_PAUSE_MS,
-    DEFAULT_CHAT_MODEL,
-    DEFAULT_DIFFICULTY,
-    DEFAULT_TRANSCRIPT_DIR,
-    DEFAULT_TURNS_PART3,
-    DEFAULT_TURNS_PART4,
-    KEY_PHRASE_LEAD_PAUSE_MS,
-    KEY_PHRASE_PAUSE_MS,
+    KEY_PHRASE_MEMORY_DISPLAY_LIMIT,
     MAX_KEY_PHRASES,
     MIN_KEY_PHRASES,
     NARRATOR_ID,
     NARRATOR_VOICE_CONFIG,
-    PASSAGE_PAUSE_MS,
-    QUESTION_PAUSE_MS,
+    PASSAGE_SPEED,
     SECTION_LAST_LINE_PAUSE_MS,
     SPEAKER_CONFIGS,
-    VALID_DIFFICULTIES,
-    VALID_PARTS,
     VOICE_POOL,
 )
+from generator import key_phrase_memory
+from generator.difficulty import DIFFICULTY_PROFILES
 from generator.prompts.templates import (
-    DIFFICULTY_BLOCKS,
     PART3_PASSAGE_SPEC_TEMPLATE,
     PART3_ROLE_HEADER,
     PART4_PASSAGE_SPEC_TEMPLATE,
@@ -57,30 +36,40 @@ from generator.prompts.templates import (
     QUESTIONS_BLOCK,
     TRAP_GUIDANCE_BLOCK,
 )
-from generator.rules import (
-    default_turns_for_part,
-    normalize_speaker_count,
-)
-from generator.text import (
-    KEY_PHRASES_LEAD_TEXT,
-    format_answer,
-    format_choice,
-    format_key_phrase,
-    format_question_stem,
-)
 from generator.types import (
     Dialogue,
     KeyPhrase,
-    PassageLine,
+    Line,
     Question,
     Section,
-    SectionType,
-    Segment,
     SpeakerConfig,
     TranscriptResponse,
 )
 
-load_dotenv()
+QUESTION_PAUSE_MS = 600
+CHOICE_PAUSE_MS = 400
+ANSWER_WAIT_MS = 2500
+ANSWER_REVEAL_PAUSE_MS = 1200
+PASSAGE_PAUSE_MS = 450
+KEY_PHRASE_PAUSE_MS = 800
+KEY_PHRASE_LEAD_PAUSE_MS = 500
+
+_EN_TERMINALS = (".", "!", "?")
+_JA_TERMINALS = ("。", ".", "!", "?", "！", "？")
+
+
+def _ensure_en_terminal(text: str) -> str:
+    cleaned = text.strip()
+    return cleaned if cleaned.endswith(_EN_TERMINALS) else cleaned + "."
+
+
+def _ensure_ja_terminal(text: str) -> str:
+    cleaned = text.strip()
+    return cleaned if cleaned.endswith(_JA_TERMINALS) else cleaned + "。"
+
+
+def _slugify(text: str) -> str:
+    return "".join(c if c.isalnum() else "_" for c in text.strip().lower()).strip("_")
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +89,7 @@ def _passage_spec_and_example(
     part: int,
     num_speakers: int,
     num_turns: int,
-) -> tuple:
+) -> Tuple[str, str, str]:
     configs = SPEAKER_CONFIGS[num_speakers]
     speaker_ids = [s["id"] for s in configs]
 
@@ -140,6 +129,19 @@ def _passage_spec_and_example(
     return role_header, passage_spec, passage_key_example
 
 
+def _format_recent_phrases_block(phrases: List[str]) -> str:
+    if not phrases:
+        return ""
+    bullets = "\n".join(f"  - {p}" for p in phrases)
+    return (
+        "\nDIVERSITY CONTEXT:\n"
+        "The following key phrases have been used in recent sessions. "
+        "Where the passage and context allow naturally, prefer different "
+        "expressions. Do not force uncommon vocabulary just to avoid these:\n"
+        f"{bullets}\n"
+    )
+
+
 def build_prompt(
     part: int,
     difficulty: str,
@@ -147,27 +149,29 @@ def build_prompt(
     num_speakers: int,
     num_turns: int,
 ) -> str:
-    """Build a ChatCompletion prompt for TOEIC Part 3 or Part 4 content."""
-    if part not in VALID_PARTS:
-        raise ValueError(f"part must be one of {VALID_PARTS}, got {part}")
-    if difficulty not in VALID_DIFFICULTIES:
-        raise ValueError(f"difficulty must be one of {VALID_DIFFICULTIES}, got {difficulty}")
-
     role_header, passage_spec, passage_key_example = _passage_spec_and_example(
         part, num_speakers, num_turns
+    )
+    profile = DIFFICULTY_PROFILES[difficulty]
+    recent_phrases = key_phrase_memory.load_recent_phrases(
+        difficulty, part, limit=KEY_PHRASE_MEMORY_DISPLAY_LIMIT
     )
 
     return PROMPT_TEMPLATE.format(
         role_header=role_header,
         part=part,
         topic=topic,
-        difficulty_block=DIFFICULTY_BLOCKS[difficulty],
+        difficulty_passage_language=profile.passage_language,
+        difficulty_information_density=profile.information_density,
+        difficulty_question_abstraction=profile.question_abstraction,
+        difficulty_distractor_subtlety=profile.distractor_subtlety,
         passage_spec=passage_spec,
         questions_block=QUESTIONS_BLOCK,
         trap_block=TRAP_GUIDANCE_BLOCK,
         min_key_phrases=MIN_KEY_PHRASES,
         max_key_phrases=MAX_KEY_PHRASES,
         passage_key_example=passage_key_example,
+        recent_phrases_block=_format_recent_phrases_block(recent_phrases),
     )
 
 
@@ -176,31 +180,26 @@ def build_prompt(
 # ---------------------------------------------------------------------------
 
 
-def assign_voices(num_speakers: int) -> Dict[str, SpeakerConfig]:
-    """Randomly assign TTS voices to each passage speaker.
-
-    The narrator voice is added separately; this function only covers
-    the speakers used inside the passage section.
-    """
+def _assign_voices(num_speakers: int) -> Dict[str, SpeakerConfig]:
     configs = SPEAKER_CONFIGS[num_speakers]
-    used_female: List[int] = []
-    used_male: List[int] = []
+    used: Dict[str, List[int]] = {"female": [], "male": []}
     speakers: Dict[str, SpeakerConfig] = {}
 
     for cfg in configs:
-        pool = VOICE_POOL[cfg["gender"]]
-        used = used_female if cfg["gender"] == "female" else used_male
-        available = [i for i in range(len(pool)) if i not in used]
+        gender = cfg["gender"]
+        pool = VOICE_POOL[gender]
+        available = [i for i in range(len(pool)) if i not in used[gender]]
         idx = random.choice(available)
-        used.append(idx)
+        used[gender].append(idx)
 
         voice_cfg = pool[idx]
         speakers[cfg["id"]] = SpeakerConfig(
             voice=voice_cfg["voice"],
-            speed=float(cfg["speed"]),
+            speed=PASSAGE_SPEED,
             instructions=voice_cfg["instructions"],
         )
 
+    speakers[NARRATOR_ID] = SpeakerConfig(**NARRATOR_VOICE_CONFIG)
     return speakers
 
 
@@ -209,132 +208,88 @@ def assign_voices(num_speakers: int) -> Dict[str, SpeakerConfig]:
 # ---------------------------------------------------------------------------
 
 
-def finalize_section(
-    section_type: SectionType,
-    segments: List[Segment],
-    *,
-    last_pause_ms: int = SECTION_LAST_LINE_PAUSE_MS,
-) -> Section:
-    """Materialize a structurally-ordered segment sequence into a Section.
+def _format_question_stem(q: Question) -> str:
+    return f"Question {q.id}. {q.text}"
 
-    The last segment's trailing pause is overridden with ``last_pause_ms``
-    regardless of what the builder emitted. This centralizes the
-    "section terminator" rule so section builders can focus purely on
-    structural order.
-    """
-    if not segments:
+
+def _format_choice(label: str, choice_text: str) -> str:
+    return f"({label}) {choice_text}"
+
+
+def _format_answer(q: Question) -> str:
+    return f"({q.answer}) {_ensure_en_terminal(q.correct_text)}"
+
+
+def _format_key_phrase(kp: KeyPhrase) -> str:
+    return f"{_ensure_en_terminal(kp.en)} {_ensure_ja_terminal(kp.ja)}"
+
+
+def _section(section_type: str, lines: List[Line], *, final: bool = False) -> Section:
+    """Build a Section, overriding the last line's trailing pause with the
+    section-last-line pause (0 when this is the terminating section)."""
+    if not lines:
         return Section(type=section_type, lines=[])
-    *head, last = segments
-    lines = [s.as_line() for s in head]
-    lines.append(
-        last.model_copy(update={"pause_ms_after": last_pause_ms}).as_line()
-    )
+    last_pause = 0 if final else SECTION_LAST_LINE_PAUSE_MS
+    lines[-1] = lines[-1].model_copy(update={"pause_ms_after": last_pause})
     return Section(type=section_type, lines=lines)
 
 
-def _build_preview_questions_section(questions: List[Question]) -> Section:
-    segments = [
-        Segment(
-            speaker=NARRATOR_ID,
-            text=format_question_stem(q),
-            pause_ms_after=QUESTION_PAUSE_MS,
-        )
-        for q in questions
-    ]
-    return finalize_section("preview_questions", segments)
-
-
-def _build_passage_section(passage_lines: List[PassageLine]) -> Section:
-    segments = [
-        Segment(
-            speaker=line.speaker,
-            text=line.text,
-            pause_ms_after=PASSAGE_PAUSE_MS,
-        )
-        for line in passage_lines
-    ]
-    return finalize_section("passage", segments)
-
-
-def _build_questions_and_answers_section(
-    questions: List[Question],
-) -> Section:
-    """Build a section that interleaves each question's choices with its
-    answer: Q1 → A/B/C/D → (wait) → answer1 → Q2 → ... → answer3."""
-    segments: List[Segment] = []
-    for q in questions:
-        segments.append(
-            Segment(
-                speaker=NARRATOR_ID,
-                text=format_question_stem(q),
-                pause_ms_after=CHOICE_PAUSE_MS,
-            )
-        )
-        for label in ("A", "B", "C"):
-            segments.append(
-                Segment(
-                    speaker=NARRATOR_ID,
-                    text=format_choice(label, getattr(q.choices, label)),
-                    pause_ms_after=CHOICE_PAUSE_MS,
-                )
-            )
-        # D choice gets a long wait before the answer reveal
-        segments.append(
-            Segment(
-                speaker=NARRATOR_ID,
-                text=format_choice("D", q.choices.D),
-                pause_ms_after=ANSWER_WAIT_MS,
-            )
-        )
-        # Answer reveal, then a short pause before next question
-        segments.append(
-            Segment(
-                speaker=NARRATOR_ID,
-                text=format_answer(q),
-                pause_ms_after=ANSWER_REVEAL_PAUSE_MS,
-            )
-        )
-    return finalize_section("questions_and_answers", segments)
-
-
-def _build_key_phrases_section(key_phrases: List[KeyPhrase]) -> Section:
-    segments = [
-        Segment(
-            speaker=NARRATOR_ID,
-            text=KEY_PHRASES_LEAD_TEXT,
-            pause_ms_after=KEY_PHRASE_LEAD_PAUSE_MS,
-        )
-    ]
-    segments.extend(
-        Segment(
-            speaker=NARRATOR_ID,
-            text=format_key_phrase(kp),
-            pause_ms_after=KEY_PHRASE_PAUSE_MS,
-        )
-        for kp in key_phrases
-    )
-    # Key phrases is the final section of the file, so its last line
-    # carries no trailing pause at all.
-    return finalize_section("key_phrases", segments, last_pause_ms=0)
-
-
-def build_sections(
-    passage_lines: List[PassageLine],
+def _build_sections(
+    passage: List[Line],
     questions: List[Question],
     key_phrases: List[KeyPhrase],
 ) -> List[Section]:
-    """Assemble the sections that feed the audio pipeline.
+    preview = [
+        Line(speaker=NARRATOR_ID, text=_format_question_stem(q), pause_ms_after=QUESTION_PAUSE_MS)
+        for q in questions
+    ]
 
-    Section order:
-        preview_questions, passage, questions_and_answers, key_phrases.
-    Each question is immediately followed by its answer after a thinking
-    pause. The section-level pauses are inserted by the TTS merge step.
-    """
+    passage_lines = [
+        Line(speaker=line.speaker, text=line.text, pause_ms_after=PASSAGE_PAUSE_MS)
+        for line in passage
+    ]
+
+    qa_lines: List[Line] = []
+    for q in questions:
+        qa_lines.append(
+            Line(speaker=NARRATOR_ID, text=_format_question_stem(q), pause_ms_after=CHOICE_PAUSE_MS)
+        )
+        for label in ("A", "B", "C"):
+            qa_lines.append(
+                Line(
+                    speaker=NARRATOR_ID,
+                    text=_format_choice(label, getattr(q.choices, label)),
+                    pause_ms_after=CHOICE_PAUSE_MS,
+                )
+            )
+        qa_lines.append(
+            Line(
+                speaker=NARRATOR_ID,
+                text=_format_choice("D", q.choices.D),
+                pause_ms_after=ANSWER_WAIT_MS,
+            )
+        )
+        qa_lines.append(
+            Line(speaker=NARRATOR_ID, text=_format_answer(q), pause_ms_after=ANSWER_REVEAL_PAUSE_MS)
+        )
+
+    kp_lines = [
+        Line(
+            speaker=NARRATOR_ID,
+            text="Key phrases.",
+            pause_ms_after=KEY_PHRASE_LEAD_PAUSE_MS,
+        )
+    ]
+    kp_lines.extend(
+        Line(speaker=NARRATOR_ID, text=_format_key_phrase(kp), pause_ms_after=KEY_PHRASE_PAUSE_MS)
+        for kp in key_phrases
+    )
+
     return [
-        _build_preview_questions_section(questions),
-        _build_passage_section(passage_lines),
-        _build_questions_and_answers_section(questions),
-        _build_key_phrases_section(key_phrases),
+        _section("preview_questions", preview),
+        _section("passage", passage_lines),
+        _section("questions_and_answers", qa_lines),
+        _section("key_phrases", kp_lines, final=True),
     ]
 
 
@@ -345,20 +300,15 @@ def build_sections(
 
 def generate_dialogue(
     client: OpenAI,
+    *,
     model: str,
     topic: str,
+    part: int,
+    difficulty: str,
     num_speakers: int,
     num_turns: int,
-    *,
-    part: int = 3,
-    difficulty: str = DEFAULT_DIFFICULTY,
 ) -> Dialogue:
-    """Call the LLM with a structured-output schema and assemble the transcript.
-
-    Raises:
-        RuntimeError: Structured LLM response was empty.
-    """
-    num_speakers = normalize_speaker_count(part, num_speakers)
+    """Call the LLM and assemble a fully-rendered Dialogue."""
     prompt = build_prompt(part, difficulty, topic, num_speakers, num_turns)
 
     completion = client.chat.completions.parse(
@@ -367,42 +317,33 @@ def generate_dialogue(
         temperature=0.8,
         response_format=TranscriptResponse,
     )
-    parsed: Optional[TranscriptResponse] = completion.choices[0].message.parsed
-    if parsed is None:
-        raise RuntimeError("Structured LLM response was empty.")
+    parsed = completion.choices[0].message.parsed
 
-    speakers = assign_voices(num_speakers)
-    speakers[NARRATOR_ID] = SpeakerConfig(**NARRATOR_VOICE_CONFIG)
+    key_phrase_memory.append_phrases(
+        difficulty, part, (kp.en for kp in parsed.key_phrases)
+    )
 
-    sections = build_sections(parsed.passage, parsed.questions, parsed.key_phrases)
+    speakers = _assign_voices(num_speakers)
+    sections = _build_sections(parsed.passage, parsed.questions, parsed.key_phrases)
 
     return Dialogue(
         title=parsed.title,
-        slug=parsed.slug or _slugify(parsed.title),
+        slug=_slugify(parsed.title),
         part=part,
         difficulty=difficulty,
         speakers=speakers,
         questions=parsed.questions,
-        key_phrases=parsed.key_phrases,
         sections=sections,
     )
 
 
-def _slugify(text: str) -> str:
-    return "".join(
-        c if c.isalnum() else "_" for c in text.strip().lower()
-    ).strip("_") or "dialogue"
-
-
 def save_dialogue(data: Dialogue, outdir: Path) -> Path:
-    """Write a Dialogue to a JSON file, avoiding overwrite."""
+    """Write a Dialogue to a JSON file, picking a non-colliding filename."""
     outdir.mkdir(parents=True, exist_ok=True)
-    slug = data.slug or "dialogue"
-    out_path = outdir / f"{slug}.json"
-
+    out_path = outdir / f"{data.slug}.json"
     counter = 1
     while out_path.exists():
-        out_path = outdir / f"{slug}_{counter}.json"
+        out_path = outdir / f"{data.slug}_{counter}.json"
         counter += 1
 
     out_path.write_text(
@@ -410,61 +351,3 @@ def save_dialogue(data: Dialogue, outdir: Path) -> Path:
         encoding="utf-8",
     )
     return out_path
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
-def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Generate TOEIC Part 3 / Part 4 transcript JSON."
-    )
-    parser.add_argument("--part", type=int, required=True, choices=list(VALID_PARTS))
-    parser.add_argument("--difficulty", default=DEFAULT_DIFFICULTY, choices=list(VALID_DIFFICULTIES))
-    parser.add_argument("--topic", required=True, help="Topic (e.g. 'hotel check-in')")
-    parser.add_argument("--speakers", type=int, default=None, choices=[2, 3], help="Part 3 only: 2 or 3 speakers")
-    parser.add_argument("--turns", type=int, default=None, help="Passage length (turns or sentences)")
-    parser.add_argument("--outdir", type=Path, default=DEFAULT_TRANSCRIPT_DIR)
-    parser.add_argument("--model", default=DEFAULT_CHAT_MODEL)
-    return parser
-
-
-def main() -> int:
-    parser = build_argparser()
-    args = parser.parse_args()
-
-    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY")
-    if not api_key:
-        print("ERROR: OPENAI_API_KEY or API_KEY is not set.", file=sys.stderr)
-        return 1
-
-    client = OpenAI(api_key=api_key)
-
-    num_speakers = normalize_speaker_count(args.part, args.speakers)
-    num_turns = args.turns if args.turns is not None else default_turns_for_part(args.part)
-
-    print(
-        f"Generating Part {args.part} ({args.difficulty}): topic='{args.topic}', "
-        f"speakers={num_speakers}, turns={num_turns} ..."
-    )
-    data = generate_dialogue(
-        client,
-        args.model,
-        args.topic,
-        num_speakers,
-        num_turns,
-        part=args.part,
-        difficulty=args.difficulty,
-    )
-
-    out_path = save_dialogue(data, args.outdir)
-    print(f"Saved: {out_path}")
-    print(f"Title: {data.title}")
-    print(f"Sections: {[s.type for s in data.sections]}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

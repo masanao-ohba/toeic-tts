@@ -1,28 +1,24 @@
-"""Pydantic v2 data models for transcript generation.
+"""Pydantic models for the TOEIC transcript pipeline.
 
-These models describe both the LLM structured output schema and the
-final transcript JSON schema. They are the single source of truth for
-field names, types, and validation constraints. Older TypedDict-based
-aliases have been removed; consumers should use these models.
+Two models live here:
+
+- ``TranscriptResponse`` — the schema the LLM structured output is
+  parsed into. Its shape matches exactly what we ask the model for.
+- ``Dialogue`` — the on-disk JSON record written under ``work/`` and
+  consumed by ``generator.tts``. It embeds speaker voice metadata and
+  the fully-rendered ``sections[]`` audio layout.
+
+Both models share ``Question`` / ``KeyPhrase`` leaf models. We
+deliberately do not use ``Literal`` to constrain enums here: input
+validation happens once at the CLI boundary (argparse choices) and
+downstream code trusts the values it receives.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List
 
 from pydantic import BaseModel, ConfigDict, Field
-
-from generator.config import MAX_KEY_PHRASES, MIN_KEY_PHRASES
-
-SectionType = Literal[
-    "preview_questions",
-    "passage",
-    "questions_and_answers",
-    "key_phrases",
-]
-Difficulty = Literal["intermediate", "advanced"]
-Part = Literal[3, 4]
-ChoiceLabel = Literal["A", "B", "C", "D"]
 
 
 class ChoiceSet(BaseModel):
@@ -40,7 +36,7 @@ class Question(BaseModel):
     id: int
     text: str
     choices: ChoiceSet
-    answer: ChoiceLabel
+    answer: str
 
     @property
     def correct_text(self) -> str:
@@ -50,18 +46,15 @@ class Question(BaseModel):
 class KeyPhrase(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    en: str = Field(min_length=1)
-    ja: str = Field(min_length=1)
+    en: str
+    ja: str
 
 
-class PassageLine(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class Line(BaseModel):
+    """A single speakable line. Used both for raw LLM passage lines and
+    for fully-rendered transcript lines. ``pause_ms_after`` is 0 for
+    raw passage lines and filled in by ``build_sections``."""
 
-    speaker: str
-    text: str
-
-
-class DialogueLine(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     speaker: str
@@ -69,33 +62,11 @@ class DialogueLine(BaseModel):
     pause_ms_after: int = 0
 
 
-class Segment(BaseModel):
-    """A structurally-ordered unit emitted by a section builder.
-
-    Segments carry a provisional trailing pause; ``finalize_section``
-    is responsible for converting a sequence of segments into a
-    ``Section`` with the section-last-line pause applied.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    speaker: str
-    text: str
-    pause_ms_after: int
-
-    def as_line(self) -> DialogueLine:
-        return DialogueLine(
-            speaker=self.speaker,
-            text=self.text,
-            pause_ms_after=self.pause_ms_after,
-        )
-
-
 class Section(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    type: SectionType
-    lines: List[DialogueLine]
+    type: str
+    lines: List[Line]
 
 
 class SpeakerConfig(BaseModel):
@@ -106,37 +77,26 @@ class SpeakerConfig(BaseModel):
     instructions: str
 
 
-class Dialogue(BaseModel):
-    """Full transcript record written to ``transcripts/*.json``.
+class TranscriptResponse(BaseModel):
+    """What the LLM returns."""
 
-    Field order matches the on-disk JSON layout so that
-    ``model_dump_json`` produces output identical to the legacy
-    ``json.dump`` writer.
-    """
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(..., min_length=1)
+    passage: List[Line]
+    questions: List[Question]
+    key_phrases: List[KeyPhrase]
+
+
+class Dialogue(BaseModel):
+    """Full transcript record written to ``work/<slug>.json``."""
 
     model_config = ConfigDict(extra="forbid")
 
     title: str
     slug: str
-    part: Part
-    difficulty: Difficulty
+    part: int
+    difficulty: str
     speakers: Dict[str, SpeakerConfig]
-    questions: List[Question] = Field(min_length=3, max_length=3)
-    key_phrases: List[KeyPhrase] = Field(
-        min_length=MIN_KEY_PHRASES, max_length=MAX_KEY_PHRASES
-    )
+    questions: List[Question]
     sections: List[Section]
-
-
-class TranscriptResponse(BaseModel):
-    """Schema enforced on the LLM structured output."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    title: str
-    slug: Optional[str] = None
-    passage: List[PassageLine] = Field(min_length=1)
-    questions: List[Question] = Field(min_length=3, max_length=3)
-    key_phrases: List[KeyPhrase] = Field(
-        min_length=MIN_KEY_PHRASES, max_length=MAX_KEY_PHRASES
-    )

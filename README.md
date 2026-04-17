@@ -13,10 +13,10 @@ OpenAI `gpt-4o-mini-tts` を使って、TOEIC **Part 3（会話）/ Part 4（説
 ## Features
 
 - **Part 3 / Part 4 両対応** — CLI または設定ファイルで切替
-- **2段階の難易度** — `intermediate` / `advanced`
+- **4段階の難易度** — `beginner` (CEFR A2 / TOEIC 400-550) / `intermediate` (B1 / 550-780) / `advanced` (B2 / 780-860) / `expert` (C1 / 860+)
 - **3設問 × 4選択肢 + 正解ラベル** を LLM に構造化生成させる
-- **9セクション固定レイアウト** で音声を結合（先読み → 短ポーズ 1500ms → 本文 → 短ポーズ 1500ms → 設問+選択肢 → 長ポーズ 8000ms → 正解 → 短ポーズ 1500ms → Key phrases）
-- **正解読み上げは `Number one. <正解選択肢の本文>.` 形式**（A/B/C/D ラベルは読まない）
+- **4セクション固定レイアウト** で音声を結合（先読み設問 → 短ポーズ 1500ms → 本文 → 短ポーズ 1500ms → 設問+選択肢+正解 → 短ポーズ 1500ms → Key phrases）
+- **正解読み上げは `(B) An office relocation.` 形式**（各設問の選択肢提示直後に続けて読み上げ）
 - **Key phrases セクション**：本文中の TOEIC 頻出表現を 3〜8 個、英日対訳で末尾にまとめて読み上げ
 - **TOEIC 頻出語彙・ひっかけパターン**（paraphrase / 時制混同 / 部分一致 / 語彙連想）をプロンプトで明示注入
 - WAV / MP3 出力
@@ -32,7 +32,7 @@ toeic-tts/
 ├── examples/
 │   ├── part3_sample_config.json
 │   └── part4_sample_config.json
-├── transcripts/                     # transcript JSON
+├── work/                            # transcript JSON / transcript.txt
 ├── output/                          # 音声出力（gitignore 推奨）
 ├── pyproject.toml
 └── .env                             # OPENAI_API_KEY
@@ -83,21 +83,19 @@ uv run python main.py --config examples/part3_sample_config.json --difficulty ad
 
 ## Audio Layout
 
-最終的な音声は以下の 9 パート構成で出力されます:
+最終的な音声は以下の 4 セクション構成で出力されます:
 
-| # | 内容 | ポーズ |
-|---|------|--------|
-| 1 | Question 1-3 の stem 先読み（選択肢なし） | 各問間 600ms |
-| 2 | (短ポーズ) | **1500ms** |
-| 3 | 本文（Part 3: 会話 / Part 4: 説明文） | 行間 450ms |
-| 4 | (短ポーズ) | **1500ms** |
-| 5 | Question 1-3 + 選択肢 A/B/C/D 読み上げ | 選択肢間 400ms / 問間 600ms |
-| 6 | (長ポーズ — 受験者が回答する時間) | **8000ms** |
-| 7 | "Number one. <正解選択肢の本文>." × 3 | 問間 700ms |
-| 8 | (短ポーズ) | **1500ms** |
-| 9 | "Key phrases." → 各 key_phrase（英→日）× 3〜8 | エントリ間 800ms |
+| # | セクション | 内容 | ポーズ |
+|---|------|------|--------|
+| 1 | `preview_questions` | Question 1-3 の stem 先読み（選択肢なし） | 各問間 600ms |
+|   | (セクション間) | — | **1500ms** |
+| 2 | `passage` | 本文（Part 3: 会話 / Part 4: 説明文） | 行間 450ms |
+|   | (セクション間) | — | **1500ms** |
+| 3 | `questions_and_answers` | Question 1-3 + 選択肢 A/B/C/D + 正解読み上げ | 選択肢間 400ms / 選択肢 D 後 2500ms（回答時間）/ 正解後 1200ms |
+|   | (セクション間) | — | **1500ms** |
+| 4 | `key_phrases` | "Key phrases." → 各 key_phrase（英→日）× 3〜8 | エントリ間 800ms |
 
-短ポーズ 1500ms と長ポーズ 8000ms は仕様上の**固定値**です。
+短ポーズ 1500ms は仕様上の**固定値**です（`config.py:SHORT_PAUSE_MS`）。最後のセクション（`key_phrases`）直後のポーズは 0ms でファイルを終端します。
 
 ## Transcript JSON Schema
 
@@ -108,10 +106,10 @@ uv run python main.py --config examples/part3_sample_config.json --difficulty ad
   "part": 3,
   "difficulty": "intermediate",
   "speakers": {
-    "W1": { "voice": "marin", "speed": 0.96, "instructions": "..." },
-    "M":  { "voice": "cedar", "speed": 0.98, "instructions": "..." },
-    "W2": { "voice": "shimmer", "speed": 0.97, "instructions": "..." },
-    "N":  { "voice": "ash", "speed": 0.97, "instructions": "TOEIC narrator..." }
+    "W1": { "voice": "marin",   "speed": 1.03, "instructions": "..." },
+    "M":  { "voice": "cedar",   "speed": 1.03, "instructions": "..." },
+    "W2": { "voice": "shimmer", "speed": 1.03, "instructions": "..." },
+    "N":  { "voice": "ash",     "speed": 1.03, "instructions": "Neutral TOEIC test narrator..." }
   },
   "questions": [
     {
@@ -126,17 +124,15 @@ uv run python main.py --config examples/part3_sample_config.json --difficulty ad
       "answer": "B"
     }
   ],
-  "key_phrases": [
-    { "en": "office relocation", "ja": "オフィス移転" },
-    { "en": "on short notice",   "ja": "急な通知で" },
-    { "en": "follow up with",    "ja": "追って連絡する" }
-  ],
   "sections": [
-    { "type": "preview_questions",     "lines": [ { "speaker": "N", "text": "Question 1. ...", "pause_ms_after": 600 } ] },
-    { "type": "passage",               "lines": [ { "speaker": "W1", "text": "...", "pause_ms_after": 450 } ] },
-    { "type": "questions_with_choices","lines": [ { "speaker": "N", "text": "Question 1. ...", "pause_ms_after": 400 } ] },
-    { "type": "answers",               "lines": [ { "speaker": "N", "text": "Number one. An office relocation.", "pause_ms_after": 700 } ] },
-    { "type": "key_phrases",           "lines": [ { "speaker": "N", "text": "Key phrases.", "pause_ms_after": 500 }, { "speaker": "N", "text": "office relocation. オフィス移転。", "pause_ms_after": 800 } ] }
+    { "type": "preview_questions",     "lines": [ { "speaker": "N",  "text": "Question 1. ...",                         "pause_ms_after": 600  } ] },
+    { "type": "passage",               "lines": [ { "speaker": "W1", "text": "...",                                      "pause_ms_after": 450  } ] },
+    { "type": "questions_and_answers", "lines": [ { "speaker": "N",  "text": "Question 1. ...",                         "pause_ms_after": 400  },
+                                                   { "speaker": "N",  "text": "(A) A software upgrade",                  "pause_ms_after": 400  },
+                                                   { "speaker": "N",  "text": "(D) A hiring decision",                   "pause_ms_after": 2500 },
+                                                   { "speaker": "N",  "text": "(B) An office relocation.",               "pause_ms_after": 1200 } ] },
+    { "type": "key_phrases",           "lines": [ { "speaker": "N",  "text": "Key phrases.",                              "pause_ms_after": 500  },
+                                                   { "speaker": "N",  "text": "office relocation. オフィス移転。",           "pause_ms_after": 800  } ] }
   ]
 }
 ```
@@ -146,25 +142,31 @@ uv run python main.py --config examples/part3_sample_config.json --difficulty ad
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `title` | string | Yes | タイトル |
-| `slug` | string | No | ファイル名に使われる |
+| `slug` | string | Yes | ファイル名に使われる（`title` から自動生成） |
 | `part` | 3 \| 4 | Yes | TOEIC パート指定 |
-| `difficulty` | "intermediate" \| "advanced" | Yes | 難易度ラベル |
+| `difficulty` | "beginner" \| "intermediate" \| "advanced" \| "expert" | Yes | 難易度ラベル（CEFR A2/B1/B2/C1 相当、TOEIC 400-550 / 550-780 / 780-860 / 860+） |
 | `speakers.<id>` | object | Yes | `voice`, `speed`, `instructions` |
 | `questions[]` | array | Yes | 3 問。`id`, `text`, `choices {A,B,C,D}`, `answer` |
-| `key_phrases[]` | array | Yes (新規生成時) | 3〜8 件。各要素は `{en, ja}` の英日対訳。範囲外は `ValueError` |
-| `sections[]` | array | Yes | 5 セクション: `preview_questions` / `passage` / `questions_with_choices` / `answers` / `key_phrases` |
-| `sections[].lines[].pause_ms_after` | int | No | 行直後のポーズ（セクション末尾は TTS 側が 1500/8000ms で上書き） |
+| `sections[]` | array | Yes | 4 セクション: `preview_questions` / `passage` / `questions_and_answers` / `key_phrases`。key_phrases は `sections` 内の `key_phrases` セクションとしてのみ保持される |
+| `sections[].lines[].pause_ms_after` | int | No | 行直後のポーズ。各セクションの最終行は `SECTION_LAST_LINE_PAUSE_MS`（300ms、最終セクションのみ 0ms）で上書きされ、セクション間には `SECTION_TRAILING_PAUSE_MS`（1500ms、最終セクションのみ 0ms）が TTS 側で挿入される |
 
 ## CLI Options (main.py)
 
 ```
 usage: main.py [-h] [--config CONFIG] [--part {3,4}]
-               [--difficulty {intermediate,advanced}] [--topic TOPIC]
+               [--difficulty {beginner,intermediate,advanced,expert}]
+               [--topic TOPIC]
                [--speakers {1,2,3}] [--turns TURNS]
                [--chat-model CHAT_MODEL] [--tts-model TTS_MODEL]
                [--speed SPEED] [--output-format {wav,mp3}]
                [--mp3-bitrate {128k,256k}]
-               [--transcript-dir TRANSCRIPT_DIR] [--audio-dir AUDIO_DIR]
+               [--audio-dir AUDIO_DIR] [--work-dir WORK_DIR]
+
+`--difficulty` choices:
+- `beginner` — CEFR A2 / TOEIC 400-550
+- `intermediate` — CEFR B1 / TOEIC 550-780
+- `advanced` — CEFR B2 / TOEIC 780-860
+- `expert` — CEFR C1 / TOEIC 860+
 ```
 
 - `--part` と `--topic` は必須（設定ファイルで指定してもよい）
