@@ -105,17 +105,20 @@ DISTRACTOR SUBTLETY:
 KEY PHRASES REQUIREMENTS:
 - Select {min_key_phrases}-{max_key_phrases} expressions drawn from the
   passage, the question, or the answer options.
-- FLOOR: choose items whose mastery would raise the learner's productive
-  English ability in future comparable situations — items the learner
-  cannot yet produce, not merely items that appear in the input.
-- Non-substitutability boundary: include only the non-substitutable
-  lexical core. Any surrounding element that can be swapped for another
-  of the same category without changing what makes the item worth
-  learning must be excluded; elements that must co-occur to preserve
-  meaning or idiomatic form (e.g. a verb with its bound preposition, or
-  the fixed parts of a collocation) are included.
+- FLOOR: the learner is studying at the passage's target proficiency
+  level. Choose items the learner cannot yet produce at that level;
+  items already producible at the target level are not key phrases.
+- Non-substitutability boundary (word- and collocation-level only — never
+  a clause or sentence fragment): include only the non-substitutable
+  lexical core. If a modifier can be replaced by another of the same
+  category and the phrase's learning value is unchanged, drop it.
+  Retain elements that must co-occur to preserve meaning or idiomatic
+  form: a verb with its bound preposition, a transitive verb with a
+  representative object, or the fixed parts of a set expression.
 - For each entry, provide a concise Japanese gloss (roughly 6-18 characters,
-  no full sentences, no trailing punctuation needed).
+  no full sentences, no trailing punctuation needed). The gloss must be a
+  genuine Japanese translation, not a katakana transliteration of the
+  English; if no meaningful Japanese rendering exists, exclude the phrase.
 
 Return ONLY a valid JSON object with this exact structure (no markdown, no explanation):
 {{
